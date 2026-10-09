@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Vehicle AR: place on any surface</title>
+<style>
+:root{--asphalt:#1d2023;--paint:#f5c518;--line:#f2f2f0;--dim:#9aa0a6}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:#0d1b12;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--line)}
+canvas{display:block}
+#ui{position:fixed;inset:0;pointer-events:none;display:flex;flex-direction:column;justify-content:space-between;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+#top{padding:12px;display:flex;gap:10px;align-items:center;justify-content:space-between}
+#status{pointer-events:none;background:rgba(29,32,35,.85);border-left:4px solid var(--paint);padding:8px 12px;border-radius:4px;font-size:14px;max-width:70%}
+#start{pointer-events:auto;background:var(--paint);color:#111;border:0;border-radius:4px;padding:11px 16px;font-weight:700;font-size:15px}
+#start[hidden]{display:none}
+#panel{pointer-events:auto;background:rgba(29,32,35,.92);padding:12px;margin:10px;border-radius:8px;display:grid;gap:10px}
+.row{display:flex;gap:8px;align-items:center}
+.row label{width:64px;font-size:13px;color:var(--dim)}
+.row input[type=range]{flex:1;accent-color:var(--paint)}
+.row output{width:44px;text-align:right;font-size:13px}
+button{font:inherit;color:var(--line);background:#2d3237;border:1px solid #454c53;border-radius:6px;padding:9px 12px;flex:1;font-size:14px}
+button:focus-visible{outline:2px solid var(--paint);outline-offset:2px}
+button.on{background:var(--paint);color:#111;border-color:var(--paint);font-weight:700}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+</head>
+<body>
+<div id="ui">
+  <div id="top">
+    <div id="status">Loading…</div>
+    <button id="start" hidden>Start AR</button>
+  </div>
+  <div id="panel">
+    <div class="row" id="types" style="flex-wrap:wrap">
+      <button data-t="car" class="on">Car</button>
+      <button data-t="truck">Truck</button>
+      <button data-t="bus">Bus</button>
+      <button data-t="van">Van</button>
+      <button data-t="bike">Bike</button>
+    </div>
+    <div class="row"><label for="rot">Heading</label><input id="rot" type="range" min="0" max="359" value="0"><output id="rotv">0°</output></div>
+    <div class="row"><label for="scl">Scale</label><input id="scl" type="range" min="-2" max="0.5" step="0.01" value="0"><output id="sclv">1.00×</output></div>
+    <div class="row" id="presets"><button data-s="0">Life-size</button><button data-s="-1">Tabletop 1:10</button><button data-s="-1.7">Toy 1:50</button></div>
+    <div class="row">
+      <button id="lane">Footprint</button>
+      <button id="undo">Undo</button>
+      <button id="clear">Clear all</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+
+const ui = document.getElementById('ui');
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('start');
+const $ = id => document.getElementById(id);
+const setStatus = s => statusEl.textContent = s;
+
+/* ---------- renderer / scene ---------- */
+const renderer = new THREE.WebGLRenderer({antialias:true, alpha:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const SKY = new THREE.Color(0x9fc9e8);
+scene.background = SKY;
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.05, 200);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x556655, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+sun.position.set(3, 8, 4);
+scene.add(sun);
+
+/* ---------- vehicles (procedural, metres, length along Z) ---------- */
+const SPECS = {
+  car:   {L:4.2, W:1.8, H:0.75, color:0xc8372d, wr:0.33},
+  truck: {L:7.5, W:2.4, H:0.9,  color:0x2f6db5, wr:0.5},
+  bus:   {L:10,  W:2.5, H:2.6,  color:0xf2b705, wr:0.5},
+  van:   {L:5.3, W:2.0, H:1.7,  color:0xe9e9e4, wr:0.38},
+  bike:  {L:2.1, W:0.8, H:0.5,  color:0x222222, wr:0.32}
+};
+const mat = (c, o={}) => new THREE.MeshStandardMaterial({color:c, roughness:.5, metalness:.25, ...o});
+function box(g, w,h,d, c, x,y,z, o){
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w,h,d), mat(c,o));
+  m.position.set(x,y,z); g.add(m); return m;
+}
+function addShadow(g,W,L){
+  const sh = new THREE.Mesh(new THREE.CircleGeometry(.5,24),
+    new THREE.MeshBasicMaterial({color:0,transparent:true,opacity:.35,depthWrite:false}));
+  sh.rotation.x = -Math.PI/2; sh.position.y = .01; sh.scale.set(W*1.05, L*1.05, 1);
+  g.add(sh);
+}
+function buildVehicle(type){
+  const s = SPECS[type], g = new THREE.Group(), {L,W,H,wr} = s;
+  const glass = 0x16222c;
+  if(type === 'car'){
+    box(g, W,H,L, s.color, 0, wr+H/2-.05, 0);
+    box(g, W*.9,.62,L*.5, glass, 0, wr+H+.26, -L*.05);
+  } else if(type === 'truck'){
+    box(g, W,1.7,2.1, s.color, 0, wr+.85+.15, L/2-1.05);        // cab
+    box(g, W*.96,.75,.05, glass, 0, wr+1.55, L/2-.02);          // windscreen
+    box(g, W,.35,L, 0x3a3f45, 0, wr+.18, 0);                    // chassis
+    box(g, W,2.3,L-2.4, 0xe9e9e4, 0, wr+1.5, -1.2);             // cargo
+  } else if(type === 'van'){
+    box(g, W,H,L, s.color, 0, wr+H/2, 0);
+    box(g, W*.96,.7,.05, glass, 0, wr+H*.7, L/2+.01);
+    box(g, W+.02,.5,1.2, glass, 0, wr+H*.72, L*.25);
+  } else if(type === 'bike'){
+    const bw = new THREE.CylinderGeometry(wr,wr,.14,20), bm = mat(0x111111,{roughness:.9});
+    [.7,-.7].forEach(z=>{ const w = new THREE.Mesh(bw,bm); w.rotation.z = Math.PI/2; w.position.set(0,wr,z); g.add(w); });
+    box(g,.18,.25,1.2,0x333333,0,wr+.35,0);
+    box(g,.26,.22,.5,0xc8372d,0,wr+.58,.15);
+    box(g,.24,.08,.6,0x111111,0,wr+.5,-.35);
+    box(g,.7,.04,.04,0x999999,0,wr+.85,.62);
+    box(g,.05,.6,.05,0x999999,0,wr+.55,.62);
+    box(g,.15,.15,.08,0xfff2b0,0,wr+.7,.7,{emissive:0xfff2b0,emissiveIntensity:1.2});
+    addShadow(g,W,L); return g;
+  } else {
+    box(g, W,H,L, s.color, 0, wr+H/2, 0);
+    box(g, W+.02,.85,L*.9, glass, 0, wr+H*.68, 0);              // windows
+    box(g, W-.1,.05,L-.1, 0xdddddd, 0, wr+H+.02, 0);            // roof
+  }
+  // lights
+  const hl = {color:0xfff2b0, emissive:0xfff2b0, emissiveIntensity:1.2};
+  const tl = {color:0xff2a2a, emissive:0xff1111, emissiveIntensity:1};
+  [-1,1].forEach(k=>{
+    box(g,.35,.14,.05, hl.color, k*W*.34, wr+H*.55, L/2, hl);
+    box(g,.35,.14,.05, tl.color, k*W*.34, wr+H*.55, -L/2, tl);
+  });
+  // wheels
+  const wz = (type==='car'||type==='van') ? [L*.32,-L*.32] : type==='truck' ? [L*.34,-L*.2,-L*.36] : [L*.32,-L*.3];
+  const wg = new THREE.CylinderGeometry(wr,wr,.28,20), wm = mat(0x111111,{roughness:.9});
+  wz.forEach(z=>[-1,1].forEach(k=>{
+    const w = new THREE.Mesh(wg,wm);
+    w.rotation.z = Math.PI/2; w.position.set(k*(W/2-.1), wr, z); g.add(w);
+  }));
+  addShadow(g,W,L);
+  return g;
+}
+function fade(obj, a){
+  obj.traverse(m=>{ if(m.material && !m.material.isMeshBasicMaterial){ m.material.transparent = true; m.material.opacity = a; }});
+}
+
+/* ---------- state ---------- */
+const st = {type:'car', heading:0, scale:1, lane:false, ghost:null, placed:[], hasHit:false};
+const hitPos = new THREE.Vector3();
+
+function refreshGhost(){
+  if(st.ghost) scene.remove(st.ghost);
+  st.ghost = buildVehicle(st.type);
+  fade(st.ghost, .6);
+  const sp = SPECS[st.type];
+  const fp = new THREE.Mesh(new THREE.PlaneGeometry(sp.W+.3, sp.L+.3),
+    new THREE.MeshBasicMaterial({color:0xf5c518,transparent:true,opacity:.25,depthWrite:false,side:THREE.DoubleSide}));
+  fp.rotation.x = -Math.PI/2; fp.position.y = .006;
+  st.ghost.add(fp); st.ghost.userData.fp = fp;
+  st.ghost.visible = st.hasHit;
+  scene.add(st.ghost);
+  applyGhost();
+}
+function applyGhost(){
+  const g = st.ghost; if(!g) return;
+  g.position.copy(hitPos);
+  g.rotation.y = THREE.MathUtils.degToRad(st.heading);
+  g.scale.setScalar(st.scale);
+  g.visible = st.hasHit;
+  if(g.userData.fp) g.userData.fp.visible = st.lane;
+  reticle.visible = st.hasHit;
+  reticle.position.copy(hitPos);
+}
+
+const reticle = new THREE.Mesh(
+  new THREE.RingGeometry(.15,.2,32).rotateX(-Math.PI/2),
+  new THREE.MeshBasicMaterial({color:0xf5c518}));
+reticle.visible = false; scene.add(reticle);
+
+function place(){
+  if(!st.hasHit) return;
+  const v = buildVehicle(st.type);
+  v.position.copy(hitPos);
+  v.rotation.y = THREE.MathUtils.degToRad(st.heading);
+  v.scale.setScalar(st.scale);
+  scene.add(v); st.placed.push(v);
+  setStatus(`${st.placed.length} vehicle${st.placed.length>1?'s':''} placed`);
+}
+
+/* ---------- UI wiring ---------- */
+ui.addEventListener('beforexrselect', e => e.preventDefault());
+$('types').addEventListener('click', e=>{
+  const b = e.target.closest('button'); if(!b) return;
+  st.type = b.dataset.t;
+  [...$('types').children].forEach(x=>x.classList.toggle('on', x===b));
+  refreshGhost();
+});
+$('rot').oninput = e => { st.heading = +e.target.value; $('rotv').textContent = st.heading+'°'; applyGhost(); };
+function setScale(v){ st.scale = Math.pow(10, v); $('scl').value = v; $('sclv').textContent = st.scale >= 0.95 ? st.scale.toFixed(2)+'×' : '1:'+Math.round(1/st.scale); applyGhost(); }
+$('scl').oninput = e => setScale(+e.target.value);
+$('presets').addEventListener('click', e=>{ const b = e.target.closest('button'); if(b) setScale(+b.dataset.s); });
+$('lane').onclick = e => { st.lane = !st.lane; e.currentTarget.classList.toggle('on', st.lane); applyGhost(); };
+$('undo').onclick = () => { const v = st.placed.pop(); if(v) scene.remove(v); setStatus(`${st.placed.length} placed`); };
+$('clear').onclick = () => { st.placed.forEach(v=>scene.remove(v)); st.placed = []; setStatus('Cleared. Tap a flat surface to place a vehicle.'); };
+
+/* ---------- desktop preview (no AR hardware) ---------- */
+const ground = new THREE.Group();
+{
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(80,80), new THREE.MeshStandardMaterial({color:0x6b7077}));
+  floor.rotation.x = -Math.PI/2; ground.add(floor);
+  const grid = new THREE.GridHelper(80,80,0xf5c518,0x8a9097); grid.position.y = .003; ground.add(grid);
+}
+const orbit = {az:.6, el:.45, dist:9, drag:false, moved:0, x:0, y:0};
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2(), plane = new THREE.Plane(new THREE.Vector3(0,1,0),0);
+function updateOrbit(){
+  camera.position.set(
+    orbit.dist*Math.sin(orbit.az)*Math.cos(orbit.el),
+    orbit.dist*Math.sin(orbit.el),
+    orbit.dist*Math.cos(orbit.az)*Math.cos(orbit.el));
+  camera.lookAt(0,0,0);
+}
+function pointerHit(e){
+  ndc.set(e.clientX/innerWidth*2-1, -(e.clientY/innerHeight)*2+1);
+  ray.setFromCamera(ndc, camera);
+  const p = new THREE.Vector3();
+  if(ray.ray.intersectPlane(plane, p)){ hitPos.copy(p); st.hasHit = true; applyGhost(); }
+}
+const cv = renderer.domElement;
+cv.addEventListener('pointerdown', e=>{ if(renderer.xr.isPresenting) return; orbit.drag=true; orbit.moved=0; orbit.x=e.clientX; orbit.y=e.clientY; });
+cv.addEventListener('pointermove', e=>{
+  if(renderer.xr.isPresenting) return;
+  if(orbit.drag){
+    orbit.moved += Math.abs(e.clientX-orbit.x)+Math.abs(e.clientY-orbit.y);
+    orbit.az -= (e.clientX-orbit.x)*.006; orbit.el = THREE.MathUtils.clamp(orbit.el+(e.clientY-orbit.y)*.006,.1,1.4);
+    orbit.x=e.clientX; orbit.y=e.clientY;
+  }
+  pointerHit(e);
+});
+cv.addEventListener('pointerup', e=>{ orbit.drag=false; if(!renderer.xr.isPresenting && orbit.moved<6){ pointerHit(e); place(); } });
+cv.addEventListener('wheel', e=>{ orbit.dist = THREE.MathUtils.clamp(orbit.dist+e.deltaY*.01,4,40); }, {passive:true});
+
+/* ---------- WebXR session ---------- */
+let hitSource = null, session = null;
+function explain(err){
+  const n = err && err.name, m = (err && err.message) || String(err);
+  if(n === 'NotSupportedError') return 'This phone or browser cannot start AR. Use Chrome on an ARCore phone and update "Google Play Services for AR".';
+  if(n === 'SecurityError' || n === 'NotAllowedError') return 'AR was blocked. Allow camera access, and open the link directly in Chrome over HTTPS (not inside WhatsApp, Instagram or another app).';
+  return 'AR failed: ' + (n ? n + ': ' : '') + m;
+}
+async function startAR(){
+  if(session) return;
+  startBtn.disabled = true;
+  setStatus('Starting AR…');
+  try{
+    try{
+      session = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures:['hit-test'],
+        optionalFeatures:['dom-overlay'],
+        domOverlay:{root:ui}
+      });
+    }catch(e1){
+      console.warn('Retrying without dom-overlay', e1);
+      session = await navigator.xr.requestSession('immersive-ar', {requiredFeatures:['hit-test']});
+    }
+    session.addEventListener('end', ()=>{
+      hitSource = null; session = null; scene.background = SKY; ground.visible = true;
+      st.hasHit = false; applyGhost(); startBtn.hidden = false; startBtn.disabled = false;
+      setStatus('AR ended. Drag to orbit, click the floor to place.');
+    });
+    scene.background = null;
+    ground.visible = false;
+    st.hasHit = false; applyGhost();
+    renderer.xr.setReferenceSpaceType('local');
+    await renderer.xr.setSession(session);
+    const viewer = await session.requestReferenceSpace('viewer');
+    hitSource = await session.requestHitTestSource({space:viewer});
+    session.addEventListener('select', place);
+    startBtn.hidden = true;
+    setStatus('Point at a floor, table, pavement or any flat surface and move slowly.');
+  }catch(err){
+    console.error(err);
+    const sess = session; session = null; hitSource = null;
+    scene.background = SKY; ground.visible = true;
+    try{ if(sess) await sess.end(); }catch(e){}
+    startBtn.disabled = false; startBtn.hidden = false;
+    setStatus(explain(err));
+  }
+}
+startBtn.onclick = startAR;
+
+/* ---------- loop ---------- */
+const m4 = new THREE.Matrix4();
+renderer.setAnimationLoop((t, frame)=>{
+  if(frame && hitSource){
+    let pose = null;
+    for(const h of frame.getHitTestResults(hitSource)){
+      const p = h.getPose(renderer.xr.getReferenceSpace());
+      if(p && p.transform.matrix[5] > 0.8){ pose = p; break; }   // flat, upward-facing surfaces only
+    }
+    if(pose){
+      m4.fromArray(pose.transform.matrix);
+      hitPos.setFromMatrixPosition(m4);
+      if(!st.hasHit) setStatus('Surface found. Tap to place the vehicle.');
+      st.hasHit = true;
+    } else if(st.hasHit){ st.hasHit = false; setStatus('Surface lost. Keep scanning.'); }
+    applyGhost();
+  }
+  if(!renderer.xr.isPresenting) updateOrbit();
+  renderer.render(scene, camera);
+});
+
+addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+/* ---------- init ---------- */
+scene.add(ground);
+refreshGhost();
+(async()=>{
+  let ok = false;
+  try{ ok = !!(navigator.xr && await navigator.xr.isSessionSupported('immersive-ar')); }catch(e){}
+  if(ok){ startBtn.hidden = false; setStatus('Tap Start AR, then scan any flat surface. Desktop preview works too.'); }
+  else{ setStatus(location.protocol==='https:'||location.hostname==='localhost'
+    ? 'AR not supported on this device. Desktop preview: drag to orbit, click the floor to place.'
+    : 'AR needs HTTPS. Desktop preview: drag to orbit, click the floor to place.'); }
+})();
+</script>
+</body>
+</html>
